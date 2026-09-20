@@ -1,0 +1,61 @@
+---
+# Service owners maintain ports here; consumers select service/contract names.
+profile::policy::services:
+  web:
+    protocols: [tcp]
+    ports: [8080]
+  api:
+    protocols: [tcp]
+    ports: [9000]
+  database:
+    protocols: [tcp]
+    ports: [15432]
+  ssh:
+    protocols: [tcp]
+    ports: [22]
+  azure_dns:
+    protocols: [udp, tcp]
+    ports: [53]
+  azure_agent:
+    protocols: [tcp]
+    ports: [80, 32526]
+
+# Applications map semantic roles to group names and fixture service names.
+profile::policy::applications:
+  app_a:
+    roles: {web: app_a.web, api: app_a.api, db: app_a.db}
+    listeners: {web: web, api: api, db: database}
+  app_b:
+    roles: {web: app_b.web, api: app_b.api, db: app_b.db}
+    listeners: {web: web, api: api, db: database}
+
+profile::policy::contracts:
+  web_to_api:
+    from_role: web
+    to_role: api
+    service: api
+  api_to_database:
+    from_role: api
+    to_role: db
+    service: database
+  app_api:
+    from_role: api
+    to_role: api
+    service: api
+
+# ALL application connections are data, including the four internal tier paths.
+# Delete a relationship to revoke its requests AND replies on both endpoints.
+profile::policy::connections:
+  a_web_to_api: {from: app_a, to: app_a, contract: web_to_api}
+  a_api_to_db: {from: app_a, to: app_a, contract: api_to_database}
+  b_web_to_api: {from: app_b, to: app_b, contract: web_to_api}
+  b_api_to_db: {from: app_b, to: app_b, contract: api_to_database}
+  a_calls_b: {from: app_a, to: app_b, contract: app_api}
+
+# Group-to-group access uses named services, never firewall resource attributes.
+profile::policy::grants:
+  users_to_a: {from: application_users, to: app_a.web, service: web}
+  users_to_b: {from: application_users, to: app_b.web, service: web}
+  administration: {from: administrators, to: application_hosts, service: ssh}
+  platform_dns: {from: application_hosts, to: azure_platform, service: azure_dns}
+  platform_agent: {from: application_hosts, to: azure_platform, service: azure_agent}

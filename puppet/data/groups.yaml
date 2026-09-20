@@ -1,0 +1,33 @@
+---
+# A group has exactly one kind: nodes, networks, members, or ipam.
+# Node references use inventory addresses; no repeated literal VM IPs.
+profile::policy::groups:
+  app_a.web:
+    nodes: [app_a-web]
+  app_a.api:
+    nodes: [app_a-api]
+  app_a.db:
+    nodes: [app_a-db]
+  app_b.web:
+    nodes: [app_b-web]
+  app_b.api:
+    nodes: [app_b-api]
+  app_b.db:
+    nodes: [app_b-db]
+  app_a:
+    members: [app_a.web, app_a.api, app_a.db]
+  app_b:
+    members: [app_b.web, app_b.api, app_b.db]
+  application_hosts:
+    members: [app_a, app_b]
+  azure_platform:
+    networks: [168.63.129.16/32]
+  administrators:
+    ipam: external.admins
+  application_users:
+    ipam: external.clients
+
+# Only these external group names and network bounds may come from IPAM.
+profile::policy::ipam_scopes:
+  external.admins: [10.60.0.0/24]
+  external.clients: [10.61.0.0/24]

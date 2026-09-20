@@ -1,0 +1,15 @@
+{
+  "profile::policy::ipam": {
+    "schema_version": 1,
+    "revision": "example-replace-before-deploy",
+    "expires_at": "2026-09-21T00:00:00Z",
+    "groups": {
+      "external.admins": [
+        "10.60.0.10/32"
+      ],
+      "external.clients": [
+        "10.61.0.0/28"
+      ]
+    }
+  }
+}

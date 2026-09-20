@@ -4,5 +4,5 @@
 *.tfstate*
 *.tfplan
 terraform/*.tfvars
-config/ipam.json
+/puppet/data/external/ipam.json
 __pycache__/

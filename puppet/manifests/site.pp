@@ -1,1 +1,1 @@
-include profile::host
+include profile::policy

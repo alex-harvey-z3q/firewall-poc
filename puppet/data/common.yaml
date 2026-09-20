@@ -1,0 +1,5 @@
+---
+# Replacement is intentional: deep/unique merges can resurrect revoked grants.
+lookup_options:
+  '^profile::policy::(inventory|groups|services|applications|contracts|connections|grants|ipam_scopes|ipam)$':
+    merge: first

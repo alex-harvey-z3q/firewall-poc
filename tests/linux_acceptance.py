@@ -2,7 +2,6 @@
 """ROOT ONLY on disposable Linux with iproute2/iptables/Puppet + pinned modules.
 Uses real Puppet providers in isolated network namespaces. No Azure credentials.
 """
-import datetime as dt
 import itertools
 import json
 import os
@@ -11,8 +10,6 @@ import subprocess as sp
 import sys
 import tempfile
 import time
-sys.path.insert(0, str(Path(__file__).resolve().parents[1] / 'scripts'))
-from compile_policy import compile_policy
 ROOT = Path(__file__).resolve().parents[1]
 PUPPET = '/opt/puppetlabs/bin/puppet'
 assert os.geteuid() == 0 and sys.platform == 'linux', 'Use a disposable Linux test VM as root'
@@ -27,10 +24,13 @@ def run(*args, **kwargs):
 def ns(name, *args, **kwargs):
     return run('ip', 'netns', 'exec', f'{PREFIX}-{name}', *args, **kwargs)
 
-inventory = json.loads((ROOT / 'config/inventory.json').read_text())
-policy = json.loads((ROOT / 'config/policy.json').read_text())
-ipam = json.loads((ROOT / 'config/ipam.example.json').read_text())
-ipam['expires_at'] = (dt.datetime.now(dt.timezone.utc) + dt.timedelta(hours=1)).isoformat()
+fixture = tempfile.TemporaryDirectory(prefix='fw-hiera-')
+fixture_root = Path(fixture.name)
+ruby = '/opt/puppetlabs/puppet/bin/ruby'
+run(ruby, str(ROOT / 'tests/fixture.rb'), str(fixture_root))
+data = json.loads(sp.check_output([ruby, str(ROOT / 'scripts/validate_data.rb'),
+                                  '--data', str(fixture_root / 'data'), '--json'], text=True))
+inventory = data['inventory']
 addresses = {n: v['ip'] for n, v in inventory['nodes'].items()}
 addresses.update(admin='10.60.0.10', client='10.61.0.10', outsider='10.62.0.10')
 ports = [22, 8080, 9000, 15432, 9999]
@@ -71,14 +71,11 @@ try:
         ns(name, 'ip', 'route', 'add', 'default', 'dev', 'eth0')
     with tempfile.TemporaryDirectory() as temp:
         temp = Path(temp)
-        hiera = temp / 'hiera.yaml'
-        hiera.write_text(f'version: 5\ndefaults:\n  datadir: {temp}\n  data_hash: json_data\nhierarchy:\n  - name: node\n    path: "%{{trusted.certname}}.json"\n')
+        hiera = fixture_root / 'hiera.yaml'
         manifest = temp / 'site.pp'
-        manifest.write_text('class { "profile::host": manage_host => false }\n')
+        manifest.write_text('class { "profile::policy": manage_host => false }\n')
         def apply():
-            result = compile_policy(inventory, policy, ipam)
-            for name, catalog in result['catalogs'].items():
-                (temp / f'{name}.json').write_text(json.dumps(catalog))
+            for name in inventory['nodes']:
                 ns(name, PUPPET, 'apply', '--certname', name, '--modulepath', f'{ROOT}/puppet/modules:{ROOT}/vendor',
                    '--hiera_config', str(hiera), '--vardir', str(temp / name), str(manifest), stdout=sp.DEVNULL)
         apply()
@@ -116,7 +113,9 @@ except socket.timeout: sys.exit(0)
             if ready.exists(): break
             time.sleep(.1)
         assert ready.exists(), 'Established-flow test did not connect'
-        policy['connections'] = []
+        data['connections'].pop('a_calls_b')
+        policy_keys = ('services', 'applications', 'contracts', 'connections', 'grants')
+        (fixture_root / 'data/policy.yaml').write_text(json.dumps({f'profile::policy::{key}': data[key] for key in policy_keys}))
         apply()
         trigger.touch()
         assert held.wait(timeout=5) == 0, 'Revoked established session still passes'
@@ -137,3 +136,5 @@ finally:
     for namespace in namespaces:
         sp.run(['ip','netns','del',namespace],check=False)
     sp.run(['ip','link','del',bridge],check=False)
+
+    fixture.cleanup()

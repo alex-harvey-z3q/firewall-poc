@@ -1,0 +1,32 @@
+---
+profile::policy::inventory:
+  network: 10.42.0.0/16
+  subnets:
+    web: 10.42.1.0/24
+    api: 10.42.2.0/24
+    db: 10.42.3.0/24
+  nodes:
+    app_a-web:
+      app: app_a
+      tier: web
+      ip: 10.42.1.10
+    app_a-api:
+      app: app_a
+      tier: api
+      ip: 10.42.2.10
+    app_a-db:
+      app: app_a
+      tier: db
+      ip: 10.42.3.10
+    app_b-web:
+      app: app_b
+      tier: web
+      ip: 10.42.1.20
+    app_b-api:
+      app: app_b
+      tier: api
+      ip: 10.42.2.20
+    app_b-db:
+      app: app_b
+      tier: db
+      ip: 10.42.3.20

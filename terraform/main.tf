@@ -28,16 +28,21 @@ variable "ssh_public_key" { type = string }
 variable "ipam_file" {
   description = "Path to validated external IPAM snapshot; relative to this directory."
   type        = string
-  default     = "../config/ipam.json"
+  default     = "../puppet/data/external/ipam.json"
 }
 variable "vm_size" {
   type    = string
   default = "Standard_B1s"
 }
 locals {
-  inventory = jsondecode(file("${path.module}/../config/inventory.json"))
-  policy    = jsondecode(file("${path.module}/../config/policy.json"))
-  ipam      = jsondecode(file(var.ipam_file))
+  # Terraform reads the SAME authored Hiera inventory as Puppet.
+  inventory     = yamldecode(file("${path.module}/../puppet/data/inventory.yaml"))["profile::policy::inventory"]
+  ipam_document = jsondecode(file(var.ipam_file))
+  ipam          = local.ipam_document["profile::policy::ipam"]
+  data_files = merge(
+    { for name in ["common.yaml", "inventory.yaml", "groups.yaml", "policy.yaml"] : name => file("${path.module}/../puppet/data/${name}") },
+    { "external/ipam.json" = jsonencode(local.ipam_document) }
+  )
 }
 resource "azurerm_resource_group" "this" {
   name     = var.prefix
@@ -95,10 +100,8 @@ resource "azurerm_linux_virtual_machine" "node" {
       permissions = "0600"
       owner       = "root:root"
       content = jsonencode({
-        node      = each.key
-        inventory = local.inventory
-        policy    = local.policy
-        ipam      = local.ipam
+        node       = each.key
+        data_files = local.data_files
       })
     }]
     runcmd = [["systemctl", "start", "--no-block", "firewall-apply.service"]]
@@ -111,7 +114,7 @@ resource "azurerm_linux_virtual_machine" "node" {
       error_message = "IPAM snapshot is expired. Fetch a fresh, reviewed snapshot."
     }
     precondition {
-      condition     = length(base64encode(jsonencode({ inventory = local.inventory, policy = local.policy, ipam = local.ipam }))) < 60000
+      condition     = length(base64encode(jsonencode({ node = each.key, data_files = local.data_files }))) < 60000
       error_message = "Bootstrap bundle exceeds safe custom-data size. Reduce IPAM memberships."
     }
   }

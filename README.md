@@ -1,145 +1,247 @@
-# Two applications, six VMs, host-enforced least privilege
+# Hiera-driven host firewalls for two Azure applications
 
-This proof of concept uses Terraform to provision six private Azure Linux VMs and **local Puppet apply** to configure their IPv4 firewalls and synthetic tier services. There is no Puppet server, Azure Firewall, NSG, service mesh, or network firewall in the enforcement path. `puppetlabs/firewall` and `alexharvey/firewall_multi` implement the application rules.
+This proof of concept puts **groups, services, application contracts and allowed relationships in checked-in Hiera YAML**. Puppet looks up that data and resolves it into `firewall_multi` resources during catalogue compilation. `puppetlabs/firewall` installs the individual Linux rules. There is no external rule-generation step.
 
-**Default deny applies to INPUT, OUTPUT and FORWARD on every VM.** A named application relationship expands into a specific caller tier, destination service and port. External IPAM supplies bounded address groups; it cannot supply rules or overwrite application identities.
+Terraform provisions six private Linux VMs: web, API and database tiers for each of two hypothetical applications. Every VM defaults to DROP for INPUT, OUTPUT and FORWARD. There is no Azure Firewall or NSG enforcement layer.
 
-IPv6 is out of scope, as requested. This is an IPv4-only deployment design. The applications are hypothetical: their web, API and database processes are deliberately small HTTP test listeners, including the database tier. They are not a production application, TLS service or actual database.
+Start with these files:
 
-## Topology
+| Hiera file | What you configure |
+|---|---|
+| [`puppet/data/groups.yaml`](puppet/data/groups.yaml) | Node groups, nested groups, network groups and external IPAM references |
+| [`puppet/data/policy.yaml`](puppet/data/policy.yaml) | Named services, application roles, contracts and allowed connections |
+| [`puppet/data/inventory.yaml`](puppet/data/inventory.yaml) | VM addresses and tier subnets; also read directly by Terraform |
+| [`puppet/data/common.yaml`](puppet/data/common.yaml) | Replacement lookup semantics, so merges cannot retain revoked grants |
+| [`puppet/data/external/ipam.example.json`](puppet/data/external/ipam.example.json) | Example IPAM Hiera document; the live `ipam.json` is ignored by Git |
+| [`puppet/hiera.yaml`](puppet/hiera.yaml) | The Hiera hierarchy |
 
-App A is an ordering application; App B is an inventory application. Ordering's API needs to call Inventory's API. Inventory does not need to initiate connections to Ordering.
+## Architecture
+
+App A is Ordering — a hypothetical order-processing application; App B is Inventory. Ordering's API calls Inventory's API.
 
 ```text
-                   External IPAM (e.g. NetBox / Infoblox)
-                          | reviewed JSON snapshot
-                          v
-    inventory.json + policy.json + bounded external groups
-                          |
-                    policy compiler
-                          |
-                 per-host Hiera rule data
-                          |
-             Puppet -> firewall_multi -> firewall
-                          |
-                          v
-     Azure VNet 10.42.0.0/16 -- private IPs, no public IPs
-     +-------------------------------------------------------+
-     |       APP A: Ordering       APP B: Inventory            |
-     |                                                       |
-     |       [A web + FW]           [B web + FW]               |
-     |       10.42.1.10            10.42.1.20                 |
-     |          | TCP 9000            | TCP 9000              |
-     |          v                     v                       |
-     |       [A API + FW] --------> [B API + FW]               |
-     |       10.42.2.10  TCP 9000   10.42.2.20                |
-     |          | TCP 15432           | TCP 15432             |
-     |          v                     v                       |
-     |       [A DB  + FW]           [B DB  + FW]               |
-     |       10.42.3.10            10.42.3.20                 |
-     +-------------------------------------------------------+
-            ^ TCP 8080 to web VMs only
-            |
-       external.clients -- existing private routing/VPN
+                      application_users (IPAM)
+                                |
+                +---------------+---------------+
+                |                               |
+             TCP 8080                        TCP 8080
+                v                               v
+  Azure VNet 10.42.0.0/16 - private addresses only
+  +-------------------------------------------------------------------+
+  |                                                                   |
+  |    APP A: ORDERING                 APP B: INVENTORY               |
+  |                                                                   |
+  |    +------------------+            +------------------+           |
+  |    | Web              |            | Web              |           |
+  |    | 10.42.1.10       |            | 10.42.1.20       |           |
+  |    +--------+---------+            +--------+---------+           |
+  |             | TCP 9000                      | TCP 9000            |
+  |             v                               v                     |
+  |    +------------------+            +------------------+           |
+  |    | API              |--TCP 9000->| API              |           |
+  |    | 10.42.2.10       |            | 10.42.2.20       |           |
+  |    +--------+---------+            +--------+---------+           |
+  |             | TCP 15432                     | TCP 15432           |
+  |             v                               v                     |
+  |    +------------------+            +------------------+           |
+  |    | Database         |            | Database         |           |
+  |    | 10.42.3.10       |            | 10.42.3.20       |           |
+  |    +------------------+            +------------------+           |
+  |                                                                   |
+  +-------------------------------------------------------------------+
 
-       external.admins  -- TCP 22 to each VM
-       each VM          -- exact Azure platform exceptions
-       every other NEW network connection: DROP
+  Each box is a Linux VM with a local firewall.
+  Arrows show permitted connection initiation; matching replies are allowed.
+  Administrators (IPAM): SSH/TCP 22 to all six VMs.
+  Each VM: only the required Azure platform traffic and host baseline.
+  All other network traffic: DROP, including forwarding.
+
+  CONFIGURATION
+
+  Hiera YAML ------+
+                   +--> Puppet --> firewall_multi --> local firewall rules
+  IPAM --> import -+
 ```
 
-The three tier subnets organize addressing; they do not grant trust. Even hosts sharing a subnet cannot contact one another without a rule. Every application flow needs an OUTPUT grant at its source and an INPUT grant at its destination. Hosts in external groups need their own routing and outbound permissions, which this repository does not manage.
+Subnets organise addresses; they do not grant trust. Each internal connection requires both a source OUTPUT rule and a destination INPUT rule. The example services are synthetic HTTP listeners, **including the database tier**. They illustrate connectivity, not a production application, TLS configuration or database engine.
 
-## Allowed connections
+## Configure logical groups in Hiera
+
+`groups.yaml` contains ordinary operator-authored data:
+
+```yaml
+profile::policy::groups:
+  app_a.web:
+    nodes: [app_a-web]
+  app_a.api:
+    nodes: [app_a-api]
+  app_a.db:
+    nodes: [app_a-db]
+  app_a:
+    members: [app_a.web, app_a.api, app_a.db]
+  application_hosts:
+    members: [app_a, app_b]
+  azure_platform:
+    networks: [168.63.129.16/32]
+  administrators:
+    ipam: external.admins
+  application_users:
+    ipam: external.clients
+```
+
+The complete file also defines App B. A group has exactly one of four kinds:
+
+- `nodes`: inventory node names, resolved to their `/32` addresses.
+- `members`: other logical group names; nesting is supported and cycles rejected.
+- `networks`: explicit, reviewed IPv4 CIDRs.
+- `ipam`: a reference to an externally supplied group.
+
+VM IPs are not repeated in the policy. The inventory is the shared address authority for both Puppet and Terraform. Unknown nodes/groups, cycles and ambiguous group definitions fail catalogue compilation. Empty groups generate no grants; they never become wildcard firewall rules.
+
+## Say “App A can call App B” in Hiera
+
+The relationship is a named entry in `policy.yaml`:
+
+```yaml
+profile::policy::connections:
+  a_calls_b: {from: app_a, to: app_b, contract: app_api}
+```
+
+It selects a published contract and application role mappings from the same file:
+
+```yaml
+profile::policy::contracts:
+  app_api:
+    from_role: api
+    to_role: api
+    service: api
+
+profile::policy::applications:
+  app_a:
+    roles:      {web: app_a.web, api: app_a.api, db: app_a.db}
+    listeners:  {web: web,       api: api,       db: database}
+  app_b:
+    roles:      {web: app_b.web, api: app_b.api, db: app_b.db}
+    listeners:  {web: web,       api: api,       db: database}
+
+profile::policy::services:
+  api:
+    protocols: [tcp]
+    ports:     [9000]
+```
+
+The relationship author knows application names and the contract, not addresses or port numbers. The service owner maintains the API port. The contract narrows the relationship to API callers and API destinations; it does not open all tiers in both applications.
+
+**All four within-application tier relationships are Hiera data too**, using `web_to_api` and `api_to_database` contracts. There are no hard-coded application connection loops in a preprocessor. Delete `a_calls_b` to revoke the cross-application connection at both endpoints. Change the `api` service's port to update every use of that service.
+
+Group-to-group permissions use named services directly:
+
+```yaml
+profile::policy::grants:
+  users_to_a:     {from: application_users, to: app_a.web,         service: web}
+  administration: {from: administrators,    to: application_hosts, service: ssh}
+  platform_dns:   {from: application_hosts, to: azure_platform,    service: azure_dns}
+```
+
+These are excerpts, not replacement versions of the complete file. Each Hiera policy key uses `merge: first`: replace the complete value when adding a higher-priority layer. Do not deep/unique-merge access lists; doing so can preserve a permission that an override intended to remove.
+
+## What Puppet does with the data
+
+[`profile::policy`](puppet/modules/profile/manifests/policy.pp) receives its parameters through Hiera automatic parameter lookup. It calls the module's [`profile::resolve_policy`](puppet/modules/profile/lib/puppet/functions/profile/resolve_policy.rb) function to validate and resolve groups, contracts and services for `trusted.certname`. The function contains generic resolution and validation logic, not application membership, port or relationship constants.
+
+The result is passed directly to [`profile::host`](puppet/modules/profile/manifests/host.pp), which declares `firewall_multi` resources. Arrays of peer addresses and protocols are expanded by `firewall_multi`. Each endpoint's local address is restricted to its own `/32`, even when its logical group contains multiple nodes. Group-to-group grants intentionally allow the Cartesian product of their members for the selected service.
+
+You can inspect the real Hiera lookup without running any generation command:
+
+```sh
+puppet lookup profile::policy::groups      --hiera_config "$PWD/puppet/hiera.yaml" --render-as yaml
+puppet lookup profile::policy::connections --hiera_config "$PWD/puppet/hiera.yaml" --explain
+```
+
+After importing a fresh snapshot, you can compile directly from the authored hierarchy:
+
+```sh
+puppet catalog compile --certname app_a-api --node_name_value app_a-api \
+  --manifest "$PWD/puppet/manifests/site.pp" \
+  --modulepath "$PWD/puppet/modules:$PWD/vendor" \
+  --hiera_config "$PWD/puppet/hiera.yaml" --render-as json
+```
+
+The transport/validation helpers do not emit firewall rules or generated per-node Hiera. They package the authored Hiera files unchanged. Puppet performs the actual Hiera lookup and resource compilation on the target.
+
+## Allowed connections and least privilege
 
 | Initiator | Destination | Protocol/port | Reason |
 |---|---|---|---|
-| `external.clients` | A web, B web | TCP 8080 | Application entry points |
+| `application_users` | A web, B web | TCP 8080 | Application entry points |
 | A web | A API | TCP 9000 | Order processing |
 | A API | A DB | TCP 15432 | Order data |
 | B web | B API | TCP 9000 | Inventory processing |
 | B API | B DB | TCP 15432 | Inventory data |
-| A API | B API | TCP 9000 | Named `app_api` contract |
-| `external.admins` | All six VMs | TCP 22 | SSH and configuration delivery |
+| A API | B API | TCP 9000 | `app_api` contract |
+| `administrators` | All six VMs | TCP 22 | Configuration delivery and SSH |
 | Each VM | `168.63.129.16` | UDP/TCP 53 | Azure DNS |
 | Each VM | `168.63.129.16` | TCP 80, 32526 | Azure guest-agent WireServer |
-| Each VM | Azure DHCP/broadcast | UDP 68 -> 67 | Lease acquisition and renewal |
+| Each VM | Azure DHCP/broadcast | UDP 68 -> 67 | Lease acquisition/renewal |
 | Azure DHCP | Each VM | UDP 67 -> 68 | DHCP response |
 
-Loopback is permitted. INPUT also admits conntrack-RELATED ICMP destination-unreachable, time-exceeded and parameter-problem messages for network error reporting and path MTU discovery. Unsolicited echo requests are denied. Packet forwarding is disabled and FORWARD is DROP. IP protocol exceptions are limited to the listed needs; application access is not granted by an ICMP exception.
+The first nine rows are data-driven named services/grants. DHCP, loopback, invalid-packet rejection and related ICMP errors form the fixed host baseline. INPUT permits only conntrack-RELATED ICMP destination-unreachable, time-exceeded and parameter-problem messages for error reporting/path MTU; unsolicited ping is denied. Forwarding is disabled and FORWARD is DROP. Azure's required platform exceptions are documented by [Microsoft](https://learn.microsoft.com/en-us/azure/virtual-network/what-is-ip-address-168-63-129-16).
 
-Azure requires the WireServer ports for its guest agent; the special address also provides DHCP and DNS. These exceptions are intentionally separate from application contracts. [Microsoft's platform-address documentation](https://learn.microsoft.com/en-us/azure/virtual-network/what-is-ip-address-168-63-129-16).
+There is no blanket `ESTABLISHED,RELATED -> ACCEPT`. Each flow has an ORIGINAL request rule constrained by endpoints and destination ports, and an ESTABLISHED/REPLY rule constrained by endpoints and source ports. Removing the grant removes both; an existing conntrack entry cannot bypass the missing rule. All built-in filter chains purge unmanaged rules, including non-Puppet rules, so removed IPAM members do not retain access. The [`firewall_multi` documentation](https://github.com/alex-harvey-z3q/puppet-firewall_multi) also calls out the need for purging.
 
-Examples of denied traffic: users to either API/database; web to database; A to B's database; B API to A API; SSH from an application VM; arbitrary Internet HTTP/HTTPS; unsolicited reverse connections; and port 9999 even on an otherwise approved destination. No package-download or arbitrary monitoring egress is enabled. Patches and dependencies arrive in replacement images. Time synchronization must use the Azure host's PTP clock in the prepared image rather than public NTP servers.
+Examples denied: users to API/database, web to database, B API initiating to A API, A to B's database, SSH from application VMs, arbitrary Internet HTTP/HTTPS, and unrelated ports on otherwise approved peers. There is no package-download or monitoring egress. Bake dependencies/patches into replacement images and use Azure host PTP time rather than public NTP servers.
 
-## Human-readable policy
+## Inject groups from external IPAM
 
-The business relationship is this entry in `config/policy.json`:
-
-```json
-"connections": [
-  {"from": "app_a", "to": "app_b", "contract": "app_api"}
-]
-```
-
-The same file defines `app_api` as caller tier `api`, destination service `api`. The service catalog maps that service to tier `api`, TCP 9000. `config/inventory.json` maps tier membership to private addresses and is also read by Terraform. There is one source of truth for host addresses.
-
-An operator adding a relationship selects application names and a published contract. They need not know the ports or addresses. The service owner maintains the contract. “App A can connect to App B” deliberately does **not** mean every A machine can reach every B machine on every port.
-
-`compile_policy.py` generates source/destination arrays in Hiera. Puppet passes them to `firewall_multi`, which expands them into individual `firewall` resources. Built-in chains purge unmanaged rules, including rules without Puppet comments. This matters when an address disappears from IPAM: addition without purging would retain old access. The module documents that behavior in its [README](https://github.com/alex-harvey-z3q/puppet-firewall_multi).
-
-There is no global `ESTABLISHED,RELATED -> ACCEPT`. Each approved flow has an ORIGINAL rule matching its destination port and an ESTABLISHED/REPLY rule matching its source port, with both endpoint address groups constrained. Removing a flow removes both rules, so existing application connections lose permission too. Conntrack entries themselves can remain; they cannot bypass the missing rule.
-
-## IPAM integration
-
-`config/ipam.example.json` is the vendor-neutral export schema:
+The live highest-priority Hiera document is `puppet/data/external/ipam.json`. It contains **only** `profile::policy::ipam`:
 
 ```json
 {
-  "schema_version": 1,
-  "revision": "netbox-export-12345",
-  "expires_at": "2026-09-21T00:00:00Z",
-  "groups": {
-    "external.admins": ["10.60.0.10/32"],
-    "external.clients": ["10.61.0.0/28"]
+  "profile::policy::ipam": {
+    "schema_version": 1,
+    "revision": "netbox-export-12345",
+    "expires_at": "2026-09-21T00:00:00Z",
+    "groups": {
+      "external.admins": ["10.60.0.10/32"],
+      "external.clients": ["10.61.0.0/28"]
+    }
   }
 }
 ```
 
-A NetBox/Infoblox adapter runs on the management or CI runner, authenticates using that system's normal secret store, selects approved records/tags, and emits this JSON. No vendor-specific API is assumed, and no IPAM credentials go into Terraform, custom-data or VMs. The implemented integration boundary is a validated snapshot import, not a live vendor API client.
+A NetBox/Infoblox adapter on your management runner exports the inner snapshot object (without the Hiera key). The importer validates it against the authored Hiera policy and atomically wraps/publishes it:
 
 ```sh
-python3 scripts/import_ipam.py /path/to/ipam-export.json
-python3 scripts/compile_policy.py
-python3 scripts/make_bundles.py
+ruby scripts/import_ipam.rb /path/to/vendor-export.json
+ruby scripts/validate_data.rb
+ruby scripts/make_bundles.rb
 ```
 
-The importer validates the complete snapshot before atomically replacing `config/ipam.json`. Validation requires exactly the approved external group names, canonical IPv4 networks, at most 64 entries per group, no duplicates, no overlap with the application VNet, and each network contained within that group's separately reviewed scope. The example scopes are `10.60.0.0/24` for admins and `10.61.0.0/24` for clients. Change these and the example memberships to your real routed networks before deploying.
+The implemented integration is a vendor-neutral snapshot boundary, not a vendor-specific API client. Keep IPAM credentials on the runner. No credentials are embedded in Terraform, custom-data or VMs. Do not put live IPAM data in Git. The example date is illustrative; use a fresh export rather than extending the date on stale data.
 
-An empty array means **no access**, never “any address.” Missing groups, unknown groups, invalid networks, expired snapshots, unknown contracts and invalid topology fail compilation. A snapshot cannot overwrite `app_a-api`, define ports, or grant arbitrary services. The expiry must be timezone-aware, in the future and no more than seven days away.
+`groups.yaml` separately defines the reviewed `ipam_scopes`: `external.admins` within `10.60.0.0/24`, and `external.clients` within `10.61.0.0/24`. Change these and memberships to your actual routed networks. Validation requires exactly those external names, canonical CIDRs within their scopes, no overlap with the application VNet, no duplicates, at most 64 entries per group, and a timezone-aware expiry within seven days. IPAM cannot overwrite internal groups, define ports or add contracts.
 
-Import is replacement, not an additive merge. Review `build/resolved-policy.json` and the generated catalog diff before delivery. Scope changes require policy review independently of IPAM. The importer validates bounds, not IPAM authenticity: use authenticated transport, restricted export permissions and a trusted management runner. Root privileges on a target remain a trusted boundary.
+An empty array means no access. Import is replacement, not additive merge. Failed imports preserve the previous approved snapshot until its lease expires. Missing/expired/invalid snapshots cause Puppet compilation to fail; the runtime wrapper keeps the host quarantined. Under normal scheduling, expiry is enforced on the next timer run, approximately 61 seconds after the preceding run; it is not instantaneous at the timestamp. The same immutable snapshot is checked again before releasing quarantine.
 
-Failed imports leave the previous approved snapshot in place until its lease expires. On a host, invalid or expired data causes quarantine. The timer checks approximately every 61 seconds after the preceding run; lease expiry is therefore bounded by that polling interval under normal scheduling, **not instant revocation at the timestamp**. The wrapper checks expiry again before releasing quarantine. The system clock, systemd and root-owned configuration are trusted. Export and deliver refreshed snapshots well before expiry; an IPAM outage must not silently extend leases.
+Authenticated transport, a trusted management runner, accurate host time and root-owned data are required. Schema validation does not establish IPAM authenticity. Refresh and deliver snapshots well before expiry. Direct `puppet catalog compile` also validates IPAM, so bypassing the importer does not bypass group-scope/expiry validation.
 
 ## Fail-closed boot and updates
 
-Starting a stock VM and installing a firewall later leaves a bootstrap exposure window. Consequently Terraform requires a **prepared image**, rather than downloading packages on first boot.
+A stock VM that downloads/configures its firewall after boot has an exposure window. Terraform therefore requires a prepared Ubuntu image with the pre-network guard already installed.
 
-1. The image's `firewall-quarantine.service` loads an IPv4 **mangle** table before the network manager starts. The network services explicitly require its success. Quarantine permits only loopback, Azure DHCP and narrowly scoped WireServer traffic; it blocks SSH and application traffic.
-2. Azure cloud-init writes the node's bundle from Terraform custom-data. It starts `firewall-apply.service` asynchronously to avoid a dependency deadlock with cloud-final.
-3. The local wrapper takes a lock and reinstalls quarantine before validation or changes. It compiles Hiera and runs Puppet entirely from local files. Puppet owns the **filter** rules; it cannot accidentally remove the separate mangle guard.
-4. Only a successful Puppet exit (0 or 2) and a second valid-lease check release the guard. The demo service then starts. Failure retains/reinstalls quarantine; a process killed during convergence leaves the already installed guard in place.
-5. A systemd timer repeats convergence. Every reboot starts in quarantine again; the system never restores a previously permissive runtime ruleset before validating current data.
+1. `firewall-quarantine.service` loads a restrictive IPv4 **mangle** table before networking; the network services require it. Only loopback, Azure DHCP and scoped WireServer traffic pass quarantine.
+2. Cloud-init writes a bundle containing the authored Hiera documents and starts the apply service asynchronously after cloud-final.
+3. The apply wrapper locks, quarantines, copies the bundle into a private temporary directory, validates it, and stages the unchanged Hiera hierarchy. No generated rule data is staged.
+4. Puppet reads that hierarchy and installs the **filter** rules. Its purging cannot remove the separate mangle guard. Only exit 0/2 and a fresh lease check release quarantine. The synthetic tier listener then starts.
+5. A systemd timer repeats convergence. Every reboot starts in quarantine rather than restoring old permissive rules. Failure leaves/reinstalls quarantine. Bundle delivery shares the same lock and uses an atomic rename.
 
-This intentionally trades availability for fail-closed behavior. Each apply briefly interrupts traffic, including SSH; schedule updates accordingly. The example is not a zero-downtime firewall controller. There is no global atomic transaction across six VMs. A changed demo unit is restarted while quarantined; first start happens after release. For coordinated changes, add destination permission before source permission; revoke at the source first, then the destination. A whole-topology cutover can quarantine all nodes before applying the new version.
+This intentionally trades availability for fail-closed behaviour: each apply briefly interrupts traffic, including SSH. It is not a zero-downtime controller or a global six-node transaction. Add destination permission before source permission; revoke at the source first. For coordinated cutover, quarantine all affected nodes before applying the new data. A changed demo unit is restarted while quarantined.
 
-The image and wrapper exclusively own the IPv4 filter and mangle tables. Do not enable UFW, firewalld, Docker/Kubernetes networking, NAT rules, other rule managers, initramfs networking or alternate networking services without redesigning the boot and ownership model. These VMs are not routers. Root or a process with NET_ADMIN can change the firewall; IP-based groups are not cryptographic application identity. Application authentication remains necessary in a real deployment.
+This design exclusively owns the IPv4 filter and mangle tables. Do not mix in UFW, firewalld, container networking, NAT, initramfs networking, another persistence service or alternate networking services without redesigning the ownership/boot model. Root/NET_ADMIN remains trusted, and IP-based groups are not application authentication.
 
-## Build the image
+## Prepare an image and deploy
 
-Use a disposable Ubuntu 24.04 Azure image builder with cloud-init and the Azure Linux agent. Install Puppet Agent 8 from your approved artifact source, Python 3, `iptables`, `iproute2`, `util-linux` and a working Azure PTP time configuration. Use one consistent iptables backend; Ubuntu's iptables-nft compatibility backend is the intended target. Ensure the `puppet/resource_api` Ruby library bundled with Puppet is available. Do not install container networking.
-
-Copy this repository to `/opt/firewall-poc` on the builder, excluding `build/`, `.terraform/`, state and credentials. Then:
+Use a disposable Ubuntu 24.04 image builder with cloud-init, the Azure Linux agent, Puppet Agent 8, Python 3, iptables, iproute2, util-linux and working Azure host PTP time. Puppet's bundled Ruby provides the data helper runtime. Use one consistent iptables backend; Ubuntu's iptables-nft compatibility backend is intended. Copy this repository to `/opt/firewall-poc`, excluding credentials, state, `build/` and `.terraform/`.
 
 ```sh
 cd /opt/firewall-poc
@@ -148,31 +250,25 @@ sudo env PATH="$PATH" bash scripts/install_modules.sh
 sudo env PATH="$PATH" bash image/prepare.sh
 ```
 
-The installer pins `puppetlabs-firewall` **8.4.0**, `alexharvey-firewall_multi` **8.4.0**, and `puppetlabs-stdlib` **9.7.0**, matching `Puppetfile`. The firewall modules have explicit compatibility requirements; do not independently upgrade one. Keep dependencies vendored in the image. `prepare.sh` disables competing firewall/persistence and Puppet-agent services and enables the local convergence units, but does not quarantine the builder's current SSH session.
+Dependencies are pinned to compatible `puppetlabs-firewall` **8.4.0**, `alexharvey-firewall_multi` **8.4.0** and `puppetlabs-stdlib` **9.7.0**. Keep them vendored in the image. `prepare.sh` checks dependencies, disables competing firewall/persistence and Puppet-agent services, and enables the local units. It does not quarantine the builder's active SSH session.
 
-Test the image's first-boot firewall ordering in an isolated image-test environment. Then clean cloud-init identity (`cloud-init clean --logs --machine-id`), deprovision the disposable builder, generalize it and capture a new image version. For example, on the builder run `sudo waagent -deprovision+user -force`; from the management runner:
+Test boot ordering in an isolated image-test environment. Clean cloud-init identity (`cloud-init clean --logs --machine-id`), run `sudo waagent -deprovision+user -force` on the disposable builder, then deallocate/generalise/capture it from your management runner:
 
 ```sh
 az vm deallocate --resource-group IMAGE_BUILDER_RG --name IMAGE_BUILDER_VM
 az vm generalize --resource-group IMAGE_BUILDER_RG --name IMAGE_BUILDER_VM
-az image create --resource-group IMAGE_BUILDER_RG --name firewall-poc-v1 \
+az image create --resource-group IMAGE_BUILDER_RG --name firewall-poc-v2 \
   --source IMAGE_BUILDER_VM --hyper-v-generation V2
 ```
 
-Deprovision/generalize is for a disposable builder and makes it unsuitable for continued normal use. Choose image generation consistent with your source VM; a Compute Gallery image version is also supported through `image_id`. See [Azure image generalization](https://learn.microsoft.com/en-us/azure/virtual-machines/generalize).
+Generalisation is for the disposable builder, not a live application VM. Match image generation to the source VM; a Compute Gallery version is also supported. See [Azure generalisation](https://learn.microsoft.com/en-us/azure/virtual-machines/generalize). Image baking is an explicit prerequisite, not an application Terraform resource. A stock marketplace image does not satisfy the boot guarantee.
 
-Image baking/capture is an explicit prerequisite, not an image resource managed by the supplied application Terraform. The image must contain the boot guard; substituting a marketplace image defeats the first-boot guarantee.
-
-## Provision the six VMs
-
-Prerequisites: Terraform 1.6+, an Azure subscription/login or workload identity, permission to create resources, the prepared image ID, an SSH public key, and private connectivity from the approved admin/client networks. The example creates a new VNet; connect it to your existing routed hub/VPN using your normal peering/routing configuration. That connectivity is a prerequisite and is not created here. The host policy uses the source IP actually observed by the VM; account for any existing SNAT when selecting IPAM groups.
+From your checkout, import a fresh snapshot and supply subscription ID, prepared image ID and SSH public key:
 
 ```sh
-# From the repository root, validate a fresh real IPAM export first.
-python3 scripts/import_ipam.py /path/to/ipam-export.json
-python3 scripts/compile_policy.py
+ruby scripts/import_ipam.rb /path/to/vendor-export.json
 cp terraform/terraform.tfvars.example terraform/terraform.tfvars
-# Edit subscription_id, image_id and ssh_public_key.
+# Edit the three required values.
 az login
 terraform -chdir=terraform init
 terraform -chdir=terraform validate
@@ -181,67 +277,46 @@ terraform -chdir=terraform apply deployment.tfplan
 terraform -chdir=terraform output nodes
 ```
 
-Terraform creates a resource group, VNet, three subnets, six NICs, six VMs and their OS disks. There are no public IPs or NAT gateways. Default Azure outbound access is disabled. Each VM receives its full reviewed bundle through custom-data. The provider lock file is included. [AzureRM's VM resource](https://registry.terraform.io/providers/hashicorp/azurerm/latest/docs/resources/linux_virtual_machine) documents the image and custom-data interfaces.
+Terraform reads `inventory.yaml` with `yamldecode` and packages the exact Hiera files into custom-data. It creates the resource group, VNet, three subnets, six NICs and six VMs/disks. No public IP or NAT gateway is created, and default Azure outbound access is disabled. The provider lock file is included.
 
-Terraform success alone is not proof of guest configuration success. Check `systemctl status firewall-apply.service`, `journalctl -u firewall-apply.service`, the actual rules and connectivity before accepting a deployment. A bad image or bundle should result in inaccessible application ports, not relaxed permissions. Azure provisioning/guest-agent completion, DHCP renewal, boot ordering, PTP and reboot behavior still need validation on Azure.
+You must provide existing private routing/peering/VPN from the management/client networks to the new VNet. That connectivity is not created here. Groups must match the source addresses seen at the VM after any external SNAT. Terraform completion does not prove guest success: check `systemctl status firewall-apply.service`, its journal, actual rules and connectivity. Azure provisioning, DHCP renewal, reboot behaviour and PTP need platform acceptance tests.
 
-The sample IPAM date is an example, not a perpetual lease. Do not automate refreshing the timestamp on old data. Terraform custom-data changes replace VMs; review the plan. For routine IPAM changes use the existing admin path to deliver a validated bundle locally without replacing a VM:
+For data-only changes, send an updated Hiera bundle without replacing the VM:
 
 ```sh
-python3 scripts/make_bundles.py
+ruby scripts/make_bundles.rb
 scp build/bundles/app_a-api.json fwadmin@10.42.2.10:bundle.json
 ssh fwadmin@10.42.2.10 'sudo /opt/firewall-poc/scripts/install_bundle.sh bundle.json'
 ```
 
-Repeat for the other five VMs with the corresponding bundles; check each run. The installer holds the same lock as convergence and atomically renames the bundle. Each apply uses an immutable copy, so a concurrent delivery cannot mix policies or lease checks. Update the source snapshot used by Terraform too, so a replacement gets current data. SSH/NET_ADMIN is a trusted management privilege, not available to the demo processes. If already quarantined, use an authenticated serial-console recovery procedure or attach the OS disk to a recovery VM; replace the bad bundle and rerun the local service. Do not recover by setting policies to ACCEPT. Azure Run Command extensions may need additional storage endpoints and are not assumed to work under this minimal policy.
+Deliver the corresponding bundle to every affected node and check convergence. Keep Terraform's source data current too; custom-data changes replace VMs, so review its plan. Existing VMs from the original JSON-preprocessor implementation require a new image or code deployment before using this bundle format. If quarantined, recover via an authenticated serial console or OS-disk attachment, correct the bundle, and rerun the local service. Do not recover by setting policy to ACCEPT. Azure Run Command extensions may require additional storage endpoints and are not assumed to work.
 
 ## Verification
 
-Local static/data checks:
-
 ```sh
-python3 -m unittest discover -s tests -v
-puppet parser validate puppet/manifests/site.pp puppet/modules/profile/manifests/host.pp
+ruby tests/test_policy.rb
+puppet parser validate puppet/manifests/site.pp puppet/modules/profile/manifests/*.pp
 bash scripts/install_modules.sh
-# Requires a valid config/ipam.json:
 bash scripts/check_catalogs.sh
+python3 tests/catalog_mutations.py
 terraform -chdir=terraform init -backend=false
 terraform -chdir=terraform validate
 ```
 
-The catalog checker compiles all six hosts using the real pinned modules, checks DROP policies and purging, and verifies that `firewall_multi` expanded address arrays. It does not apply rules to the development machine. Catalogs and per-node Facter diagnostics are under `build/`.
+The Ruby tests validate data semantics and the complete request matrix independently of desired rule titles. The catalogue checker copies the authored YAML, uses a short-lived **test-only** IPAM fixture, and compiles all six hosts with the real modules. No live IPAM snapshot is required for those tests. `catalog_mutations.py` edits only Hiera data and recompiles real catalogues to prove contract revocation on both endpoints, named service port changes, IPAM membership replacement and empty-group denial. Catalogues/Facter diagnostics are written under `build/`.
 
-On a **disposable Linux test VM**, install Puppet 8, Python, iptables and iproute2, vendor the pinned modules, then run:
+On a disposable Linux VM with Puppet 8, Python, iptables, iproute2 and the pinned modules:
 
 ```sh
 sudo python3 tests/linux_acceptance.py
 ```
 
-This test uses real Puppet providers in separate network namespaces. It puts listeners on every tested port, then checks 240 positive/negative source/destination/port combinations (including admin, client and untrusted hosts), a TCP session held across contract revocation, and deletion of a foreign ACCEPT rule. It avoids configuring host services/sysctls. It changes a temporary bridge and namespaces, so use a dedicated test VM rather than a workstation or production host.
+This applies Puppet directly from the Hiera hierarchy in isolated network namespaces. Listeners deliberately occupy every tested port, so a deny cannot pass through mere connection refusal. It checks 240 network probes, an established session across Hiera contract deletion, and removal of a foreign ACCEPT rule. It uses a temporary bridge/namespaces and does not configure host services/sysctls.
 
-Azure acceptance checklist:
+On Azure, additionally verify first boot has no reachable application/SSH window, test ingress and egress separately, remove an IPAM member and a contract while connections are active, inject an unmanaged rule, exercise invalid/expired data, reboot and test recovery. Lease-expiry and systemd behaviour are platform checks, not established by successful catalogue compilation.
 
-- Observe first boot with no window of reachable SSH/app ports before successful configuration.
-- Verify the allowed matrix and forbidden examples against actual private VM addresses; test both OUTPUT and INPUT using a probe host with the opposite side permissive.
-- Remove a contract and an IPAM member, reapply to affected hosts, and test new **and already established** connections.
-- Inject an unmanaged accept rule, reapply, and confirm removal.
-- Submit empty, malformed, out-of-scope and expired IPAM data. Confirm empty groups grant nothing and invalid local bundles retain quarantine.
-- Reboot; verify DROP policies, no forwarding, DNS/DHCP/WireServer health, service recovery and accurate host time.
-- Observe snapshot expiry and loss of management access; exercise console/disk recovery before relying on it operationally.
+**Validation boundary:** local Ruby tests, real Puppet catalogue checks and Terraform validation can run in this macOS environment. Linux packet enforcement and Azure deployment have not been executed here: no Linux/Docker daemon is running and no Azure deployment inputs/image were supplied. No cloud resources have been created. macOS Facter may emit memory-fact diagnostics while catalogue compilation still succeeds.
 
-Validation performed in the development environment: the Python policy tests, Puppet parser checks, six real module catalog compilations and Terraform provider validation. Linux packet-level and Azure deployment tests have **not** been executed here; this macOS environment has no running Docker/Linux daemon, and no deployment image or Azure subscription inputs were supplied. Local Facter produced macOS memory-fact diagnostics; catalog compilation and resource assertions nevertheless succeeded. No cloud resources were created.
+## Licence
 
-## Repository map
-
-| Path | Purpose |
-|---|---|
-| `config/inventory.json` | Shared Terraform/policy node addresses |
-| `config/policy.json` | Service contracts, app relationships, IPAM scope boundaries |
-| `config/ipam.example.json` | External IPAM snapshot example |
-| `scripts/compile_policy.py` | Validating policy compiler, Hiera and resolved-policy output |
-| `scripts/import_ipam.py` | Atomic validated snapshot import |
-| `scripts/make_bundles.py`, `scripts/install_bundle.sh` | Per-host payloads and serialized atomic activation |
-| `puppet/modules/profile/manifests/host.pp` | Default-deny chains, exceptions, expanded rules, host configuration |
-| `scripts/apply.sh`, `image/` | Fail-closed boot, update guard, local Puppet timer, image preparation |
-| `terraform/` | Six private Azure VMs and supporting network resources |
-| `tests/` | Policy validation and Linux enforcement acceptance tests |
+MIT.

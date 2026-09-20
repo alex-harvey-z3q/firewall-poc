@@ -1,7 +1,17 @@
+---
 version: 5
 defaults:
-  datadir: /var/lib/firewall-poc/hiera
-  data_hash: json_data
+  datadir: data
+  data_hash: yaml_data
 hierarchy:
-  - name: Per-host compiled policy
-    path: "%{trusted.certname}.json"
+  - name: External IPAM snapshot (only profile::policy::ipam)
+    path: external/ipam.json
+    data_hash: json_data
+  - name: Application contracts and access policy
+    path: policy.yaml
+  - name: Logical address groups
+    path: groups.yaml
+  - name: Shared VM inventory (also read by Terraform)
+    path: inventory.yaml
+  - name: Lookup behavior
+    path: common.yaml

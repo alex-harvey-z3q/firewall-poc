@@ -12,7 +12,7 @@ bash scripts/install_modules.sh
 /opt/puppetlabs/bin/puppet --version | grep '^8\.'
 for module in firewall firewall_multi stdlib; do test -f "vendor/$module/metadata.json"; done
 chmod 755 scripts/apply.sh
-install -d -m 700 /etc/firewall-poc /var/lib/firewall-poc/hiera
+install -d -m 700 /etc/firewall-poc
 install -m 644 image/firewall-*.service image/firewall-apply.timer /etc/systemd/system/
 # Explicit dependency means networking fails if the early firewall cannot load.
 for unit in systemd-networkd NetworkManager; do
