@@ -1,0 +1,12 @@
+[Unit]
+Description=Fail-closed IPv4 firewall before network setup
+DefaultDependencies=no
+After=local-fs.target
+Before=network-pre.target systemd-networkd.service NetworkManager.service
+Wants=network-pre.target
+[Service]
+Type=oneshot
+ExecStart=/bin/sh -c '/usr/sbin/iptables-restore --wait 10 < /opt/firewall-poc/image/quarantine.rules'
+RemainAfterExit=yes
+[Install]
+WantedBy=sysinit.target

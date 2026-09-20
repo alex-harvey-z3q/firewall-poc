@@ -1,0 +1,14 @@
+*mangle
+:PREROUTING ACCEPT [0:0]
+:INPUT DROP [0:0]
+:FORWARD DROP [0:0]
+:OUTPUT DROP [0:0]
+:POSTROUTING ACCEPT [0:0]
+-A INPUT -i lo -j ACCEPT
+-A OUTPUT -o lo -j ACCEPT
+-A INPUT -s 168.63.129.16/32 -p udp --sport 67 --dport 68 -j ACCEPT
+-A OUTPUT -d 255.255.255.255/32 -p udp --sport 68 --dport 67 -j ACCEPT
+-A OUTPUT -d 168.63.129.16/32 -p udp --sport 68 --dport 67 -j ACCEPT
+-A OUTPUT -d 168.63.129.16/32 -p tcp -m multiport --dports 80,32526 -m conntrack --ctstate NEW,ESTABLISHED --ctdir ORIGINAL -j ACCEPT
+-A INPUT -s 168.63.129.16/32 -p tcp -m multiport --sports 80,32526 -m conntrack --ctstate ESTABLISHED --ctdir REPLY -j ACCEPT
+COMMIT

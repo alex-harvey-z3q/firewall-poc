@@ -1,0 +1,8 @@
+[Unit]
+Description=Validate IPAM and apply local Puppet firewall
+After=cloud-final.service
+Requires=firewall-quarantine.service
+[Service]
+Type=oneshot
+ExecStart=/opt/firewall-poc/scripts/apply.sh
+TimeoutStartSec=180

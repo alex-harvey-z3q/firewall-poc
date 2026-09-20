@@ -1,0 +1,8 @@
+/vendor/
+/build/
+**/.terraform/
+*.tfstate*
+*.tfplan
+terraform/*.tfvars
+config/ipam.json
+__pycache__/

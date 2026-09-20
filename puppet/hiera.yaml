@@ -1,0 +1,7 @@
+version: 5
+defaults:
+  datadir: /var/lib/firewall-poc/hiera
+  data_hash: json_data
+hierarchy:
+  - name: Per-host compiled policy
+    path: "%{trusted.certname}.json"
